@@ -1,0 +1,33 @@
+# Core dependencies
+certifi==2025.4.26
+charset-normalizer==3.4.2
+idna==3.10
+requests>=2.31.0
+urllib3==2.4.0
+python-dateutil>=2.8.2
+
+# Analysis libraries
+nltk>=3.8.1
+pandas>=2.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+wordcloud>=1.9.0
+numpy>=1.24.0
+
+# API and server
+python-dotenv>=1.0.0
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.6.0
+
+# Rate limiting and security
+fastapi-limiter>=0.1.5
+redis>=5.0.1
+
+# Production dependencies
+gunicorn>=21.0.0
+uvloop>=0.19.0; sys_platform != 'win32'  # High-performance event loop (not for Windows)
+httptools>=0.6.0  # Fast HTTP parsing
+pytimeparse>=1.1.8  # Time string parsing
+tenacity>=8.2.3  # Retry library
+loguru>=0.7.2  # Better logging

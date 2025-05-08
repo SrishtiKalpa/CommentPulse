@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "CommentPulse - YouTube Comment Analysis",
+  "version": "1.2",
+  "description": "Analyze YouTube video comments with AI-powered insights",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://localhost:8000/*"
+  ],
+  "action": {
+    "default_title": "CommentPulse"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["content.js"]
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["drawer.html", "drawer.js", "drawer.css", "icons/*", "js/*"],
+      "matches": ["*://*.youtube.com/*"]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

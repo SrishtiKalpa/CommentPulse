@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>CommentPulse Drawer</title>
+  <link rel="stylesheet" href="drawer.css">
+</head>
+<body>
+  <div class="drawer-container">
+    <div class="drawer-header">
+      <div class="logo-container">
+        <h1>CommentPulse Analysis</h1>
+      </div>
+      <button id="close-drawer" class="icon-button">×</button>
+    </div>
+    
+    <div id="loading" class="loading">
+      <div id="loading-message">Analyzing comments... This may take a few moments.</div>
+    </div>
+    
+    <div id="error" class="error"></div>
+    
+    <div id="content" style="display: none;">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <h3>Total Comments</h3>
+          <div id="total-comments" class="stat-value">-</div>
+        </div>
+        <div class="stat-card">
+          <h3>Average Sentiment</h3>
+          <div id="avg-sentiment" class="stat-value">-</div>
+        </div>
+        <div class="stat-card">
+          <h3>Top Topic</h3>
+          <div id="top-topic" class="stat-value">-</div>
+        </div>
+        <div class="stat-card">
+          <h3>Engagement Score</h3>
+          <div id="engagement-score" class="stat-value">-</div>
+        </div>
+      </div>
+      
+      <div class="chart-container">
+        <canvas id="sentiment-chart"></canvas>
+      </div>
+      
+      <div class="chart-container">
+        <canvas id="engagement-chart"></canvas>
+      </div>
+      
+      <div class="summary-container">
+        <h3>Analysis Summary</h3>
+        <div id="summary-container">
+          <div id="summary-loading" class="summary-loading">Generating summary...</div>
+          <div id="summary-content" class="summary-content">
+            <div id="summary-highlights" class="summary-highlights">
+              <h4>Key Insights</h4>
+              <ul id="summary-highlights-list">
+                <!-- Key insights will be added here dynamically -->
+              </ul>
+            </div>
+            <div id="summary-text-container">
+              <h4>Detailed Analysis</h4>
+              <p id="summary-text" class="summary-text">-</p>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <div class="visualizations-container">
+        <h3>Visualizations</h3>
+        <div id="visualizations-grid">
+          <!-- Visualization images will be added here dynamically -->
+        </div>
+      </div>
+    </div>
+    
+    <div class="drawer-footer">
+      <button id="analyze-btn" class="button">Analyze Comments</button>
+    </div>
+  </div>
+  
+  <script src="js/vendor/chart.js"></script>
+  <script src="drawer.js"></script>
+</body>
+</html>
