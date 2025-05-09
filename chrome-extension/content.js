@@ -127,11 +127,29 @@ function injectDrawer() {
 // Toggle the drawer open/closed
 function toggleDrawer() {
   if (drawerOpen) {
+    // Close the drawer
     drawerFrame.style.right = '-400px';
     drawerOpen = false;
+    
+    // Rotate the toggle button back to normal
+    toggleButton.style.transform = 'rotate(0deg)';
+    
+    // If we have a current video ID, tell the drawer to clean up
+    const videoId = getVideoId();
+    if (videoId) {
+      drawerFrame.contentWindow.postMessage({
+        source: 'comment-pulse-content',
+        action: 'closeDrawer',
+        videoId: videoId
+      }, '*');
+    }
   } else {
+    // Open the drawer
     drawerFrame.style.right = '0';
     drawerOpen = true;
+    
+    // Rotate the toggle button to indicate it's active
+    toggleButton.style.transform = 'rotate(45deg)';
     
     // Send the current video ID to the drawer
     const videoId = getVideoId();
@@ -148,6 +166,12 @@ function toggleDrawer() {
 // Listen for messages from the extension
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log("Content script received message:", request);
+  
+  if (request.action === 'ping') {
+    // Respond with success to indicate we're ready
+    sendResponse({ ready: true });
+    return;
+  }
   
   if (request.action === 'getVideoId') {
     const videoId = getVideoId();

@@ -23,6 +23,12 @@ document.addEventListener('DOMContentLoaded', () => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       chrome.tabs.sendMessage(tabs[0].id, { action: 'closeDrawer' });
     });
+    
+    // Also send a message to the parent window (content script)
+    window.parent.postMessage({
+      source: 'comment-pulse-drawer',
+      action: 'closeDrawer'
+    }, '*');
   });
   
   // Function to delete the analysis directory
