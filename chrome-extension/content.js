@@ -137,11 +137,19 @@ function toggleDrawer() {
     // If we have a current video ID, tell the drawer to clean up
     const videoId = getVideoId();
     if (videoId) {
+      // Tell the drawer to clean up
       drawerFrame.contentWindow.postMessage({
         source: 'comment-pulse-content',
         action: 'closeDrawer',
         videoId: videoId
       }, '*');
+      
+      // Also send a direct cleanup request to the API
+      fetch(`http://localhost:8000/cleanup/${videoId}`, {
+        method: 'DELETE'
+      }).catch(e => {
+        console.error('Error sending cleanup request:', e);
+      });
     }
   } else {
     // Open the drawer
@@ -217,12 +225,41 @@ window.addEventListener('message', function(event) {
   }
 });
 
-// Initialize the drawer when the page loads
-window.addEventListener('load', function() {
-  // Only inject on YouTube video pages
-  const url = window.location.href;
-  if (url.includes('youtube.com/watch') || url.includes('youtube.com/shorts')) {
-    injectDrawer();
+// Initialize when the DOM is fully loaded
+document.addEventListener('DOMContentLoaded', () => {
+  console.log('CommentPulse content script loaded');
+  injectDrawer();
+});
+
+// Handle tab/window closing
+window.addEventListener('beforeunload', function() {
+  // If the drawer is open and we have a video ID, clean up the analysis directory
+  if (drawerOpen && drawerFrame) {
+    const videoId = getVideoId();
+    if (videoId) {
+      // Send a cleanup request to the API
+      fetch(`http://localhost:8000/cleanup/${videoId}`, {
+        method: 'DELETE',
+        // Use keepalive to ensure the request completes even as the page unloads
+        keepalive: true
+      }).catch(e => {
+        // We can't really handle errors here as the page is unloading
+        console.error('Error sending cleanup request:', e);
+      });
+      
+      // Also try to notify the drawer to clean up
+      if (drawerFrame && drawerFrame.contentWindow) {
+        try {
+          drawerFrame.contentWindow.postMessage({
+            source: 'comment-pulse-content',
+            action: 'cleanup',
+            videoId: videoId
+          }, '*');
+        } catch (e) {
+          console.error('Error sending cleanup message to drawer:', e);
+        }
+      }
+    }
   }
 });
 

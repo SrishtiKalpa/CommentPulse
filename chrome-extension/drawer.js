@@ -16,7 +16,7 @@ document.addEventListener('DOMContentLoaded', () => {
   closeBtn.addEventListener('click', () => {
     // If we have a current video ID and analysis was performed, delete the analysis directory
     if (currentVideoId) {
-      //deleteAnalysisDirectory(currentVideoId);
+      deleteAnalysisDirectory(currentVideoId);
     }
     
     // Send message to content script to close drawer
@@ -76,11 +76,19 @@ document.addEventListener('DOMContentLoaded', () => {
       // Enable analyze button
       analyzeBtn.disabled = false;
       
-      sendResponse({ success: true });
+      // Start analysis
+      analyzeComments(message.videoId);
+    } else if (message.action === 'closeDrawer') {
+      // Handle close action if needed
+      if (currentVideoId) {
+        deleteAnalysisDirectory(currentVideoId);
+      }
+    } else if (message.action === 'cleanup' && message.videoId) {
+      // Handle cleanup request
+      deleteAnalysisDirectory(message.videoId);
     }
     
-    // Return true to indicate we'll respond asynchronously
-    return true;
+    return true; // Will respond asynchronously
   });
   
   // Also listen for messages from the window (from content script)
@@ -97,6 +105,15 @@ document.addEventListener('DOMContentLoaded', () => {
         
         // Enable analyze button
         analyzeBtn.disabled = false;
+      } else if (event.data.action === 'cleanup' && event.data.videoId) {
+        // Handle cleanup request when tab is closing
+        console.log('Received cleanup request for video ID:', event.data.videoId);
+        deleteAnalysisDirectory(event.data.videoId);
+      } else if (event.data.action === 'closeDrawer') {
+        // Handle close request
+        if (currentVideoId) {
+          deleteAnalysisDirectory(currentVideoId);
+        }
       }
     }
   });
