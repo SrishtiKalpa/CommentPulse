@@ -14,11 +14,48 @@ document.addEventListener('DOMContentLoaded', () => {
   
   // Listen for close button click
   closeBtn.addEventListener('click', () => {
+    // If we have a current video ID and analysis was performed, delete the analysis directory
+    if (currentVideoId) {
+      //deleteAnalysisDirectory(currentVideoId);
+    }
+    
     // Send message to content script to close drawer
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       chrome.tabs.sendMessage(tabs[0].id, { action: 'closeDrawer' });
     });
   });
+  
+  // Function to delete the analysis directory
+  async function deleteAnalysisDirectory(videoId) {
+    try {
+      // Get API endpoint
+      let apiUrl = 'http://localhost:8000';
+      try {
+        const hostPermissions = chrome.runtime.getManifest().host_permissions;
+        if (hostPermissions && hostPermissions.length > 0) {
+          apiUrl = hostPermissions[0].replace('/*', '');
+        }
+      } catch (error) {
+        console.warn('Could not get API URL from manifest, using default:', error);
+      }
+      
+      console.log(`Attempting to delete analysis directory for video ${videoId}`);
+      
+      // Send delete request to the API
+      const response = await fetch(`${apiUrl}/cleanup/${videoId}`, {
+        method: 'DELETE'
+      });
+      
+      if (response.ok) {
+        const result = await response.json();
+        console.log('Analysis directory deleted:', result);
+      } else {
+        console.error('Failed to delete analysis directory:', response.statusText);
+      }
+    } catch (error) {
+      console.error('Error deleting analysis directory:', error);
+    }
+  }
   
   // Listen for messages from content script and background script
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -591,54 +628,155 @@ document.addEventListener('DOMContentLoaded', () => {
     const visualizationsGrid = document.getElementById('visualizations-grid');
     visualizationsGrid.innerHTML = ''; // Clear existing content
     
-    // Check if visualizations are available
-    const visualizations = data.visualizations || (data.analysis_results && data.analysis_results.visualizations) || [];
-    if (Array.isArray(visualizations) && visualizations.length > 0) {
-      // Create a proxy URL for each visualization
-      visualizations.forEach((vizPath, index) => {
-        // Create a container for each visualization
-        const vizContainer = document.createElement('div');
-        vizContainer.style.marginBottom = '20px';
+    // Define the standard PNG visualizations we want to display
+    const standardVisualizations = [
+      {
+        title: 'Sentiment Distribution',
+        filename: 'sentiment_distribution.png'
+      },
+      {
+        title: 'Word Cloud',
+        filename: 'wordcloud.png'
+      },
+      {
+        title: 'Engagement Over Time',
+        filename: 'engagement_over_time.png'
+      },
+      {
+        title: 'Activity Heatmap',
+        filename: 'activity_heatmap.png'
+      }
+    ];
+    
+    // Create a title for the visualizations section
+    const sectionTitle = document.createElement('h3');
+    sectionTitle.textContent = 'Visualizations';
+    sectionTitle.style.marginTop = '20px';
+    sectionTitle.style.marginBottom = '15px';
+    sectionTitle.style.color = '#1a73e8';
+    sectionTitle.style.textAlign = 'center';
+    visualizationsGrid.appendChild(sectionTitle);
+    
+    // Add image path information for debugging
+    const pathInfo = document.createElement('div');
+    pathInfo.style.fontSize = '0.8em';
+    pathInfo.style.color = '#666';
+    pathInfo.style.textAlign = 'center';
+    pathInfo.style.marginBottom = '15px';
+    pathInfo.innerHTML = `Loading from: <code>http://localhost:8000/analysis/analysis_${currentVideoId}/</code>`;
+    visualizationsGrid.appendChild(pathInfo);
+    
+    // Add each visualization
+    standardVisualizations.forEach(viz => {
+      const vizContainer = document.createElement('div');
+      vizContainer.style.marginBottom = '25px';
+      vizContainer.style.padding = '15px';
+      vizContainer.style.backgroundColor = '#f8f9fa';
+      vizContainer.style.borderRadius = '8px';
+      vizContainer.style.boxShadow = '0 1px 3px rgba(0,0,0,0.1)';
+      
+      // Create a title for the visualization
+      const vizTitle = document.createElement('h4');
+      vizTitle.textContent = viz.title;
+      vizTitle.style.margin = '0 0 15px 0';
+      vizTitle.style.color = '#202124';
+      vizTitle.style.textAlign = 'center';
+      
+      // Create the image element
+      const img = document.createElement('img');
+      const imageUrl = `http://localhost:8000/analysis/analysis_${currentVideoId}/${viz.filename}`;
+      img.src = imageUrl;
+      img.alt = viz.title;
+      img.style.maxWidth = '100%';
+      img.style.height = 'auto';
+      img.style.borderRadius = '8px';
+      img.style.boxShadow = '0 2px 4px rgba(0,0,0,0.1)';
+      img.style.display = 'none'; // Hide initially until loaded
+      
+      console.log(`Loading visualization: ${imageUrl}`);
+      
+      // Add loading indicator
+      const loadingIndicator = document.createElement('div');
+      loadingIndicator.textContent = 'Loading visualization...';
+      loadingIndicator.style.textAlign = 'center';
+      loadingIndicator.style.color = '#666';
+      loadingIndicator.style.padding = '20px';
+      
+      // Handle image loading errors
+      img.onerror = function() {
+        console.error(`Failed to load visualization: ${imageUrl}`);
+        loadingIndicator.style.display = 'none';
+        const errorMsg = document.createElement('div');
+        errorMsg.style.textAlign = 'center';
+        errorMsg.style.color = '#ea4335';
+        errorMsg.style.padding = '20px';
+        errorMsg.innerHTML = 'Could not load visualization<br><small>Make sure the API server is running and visualizations were generated</small>';
         
-        // Create a title for the visualization
-        const vizTitle = document.createElement('h4');
-        vizTitle.style.margin = '0 0 8px 0';
+        // Add direct link to try accessing the image directly
+        const directLinkDiv = document.createElement('div');
+        directLinkDiv.style.marginTop = '10px';
+        directLinkDiv.style.fontSize = '0.9em';
+        directLinkDiv.innerHTML = `<a href='${imageUrl}' target='_blank'>Try direct link</a>`;
         
-        // Extract the filename from the path
-        const filename = vizPath.split('/').pop();
-        const prettyName = filename.replace(/_/g, ' ').replace('.png', '');
-        vizTitle.textContent = prettyName.charAt(0).toUpperCase() + prettyName.slice(1);
+        // Add a try different video ID suggestion
+        const suggestionDiv = document.createElement('div');
+        suggestionDiv.style.marginTop = '10px';
+        suggestionDiv.style.fontSize = '0.9em';
+        suggestionDiv.style.color = '#666';
+        suggestionDiv.innerHTML = 'Try analyzing video ID: <strong>2u80yFDtszE</strong><br>This video has pre-generated visualizations';
         
-        // Create a link to open the visualization in a new tab
-        const vizLink = document.createElement('a');
-        vizLink.href = `http://localhost:8000/${vizPath}`;
-        vizLink.target = '_blank';
-        vizLink.textContent = 'Open in new tab';
-        vizLink.style.display = 'block';
-        vizLink.style.marginBottom = '8px';
-        vizLink.style.color = '#1a73e8';
-        
-        // Create an image element for the visualization
-        const vizImage = document.createElement('img');
-        vizImage.src = `http://localhost:8000/${vizPath}`;
-        vizImage.alt = prettyName;
-        vizImage.style.width = '100%';
-        vizImage.style.borderRadius = '4px';
-        vizImage.style.boxShadow = '0 1px 3px rgba(0,0,0,0.1)';
-        
-        // Add elements to the container
-        vizContainer.appendChild(vizTitle);
-        vizContainer.appendChild(vizLink);
-        vizContainer.appendChild(vizImage);
-        
-        // Add the container to the grid
-        visualizationsGrid.appendChild(vizContainer);
-      });
-    } else {
-      // Display a message if no visualizations are available
-      const noVizMessage = document.createElement('p');
-      noVizMessage.textContent = 'No visualizations available';
-      visualizationsGrid.appendChild(noVizMessage);
-    }
+        vizContainer.appendChild(errorMsg);
+        vizContainer.appendChild(directLinkDiv);
+        vizContainer.appendChild(suggestionDiv);
+      };
+      
+      // Handle successful image loading
+      img.onload = function() {
+        loadingIndicator.style.display = 'none';
+        img.style.display = 'block';
+        img.style.opacity = '1';
+        console.log(`Successfully loaded visualization: ${imageUrl}`);
+      };
+      
+      // Add elements to the container
+      vizContainer.appendChild(vizTitle);
+      vizContainer.appendChild(loadingIndicator);
+      vizContainer.appendChild(img);
+      visualizationsGrid.appendChild(vizContainer);
+    });
+    
+    // Add a download link at the bottom
+    const downloadContainer = document.createElement('div');
+    downloadContainer.style.textAlign = 'center';
+    downloadContainer.style.marginTop = '20px';
+    
+    const downloadLink = document.createElement('a');
+    downloadLink.textContent = 'Download Analysis Results (JSON)';
+    downloadLink.style.display = 'inline-block';
+    downloadLink.style.padding = '8px 16px';
+    downloadLink.style.backgroundColor = '#1a73e8';
+    downloadLink.style.color = 'white';
+    downloadLink.style.textDecoration = 'none';
+    downloadLink.style.borderRadius = '4px';
+    downloadLink.href = '#';
+    downloadLink.onclick = function(e) {
+      e.preventDefault();
+      // Create a blob with the JSON data
+      const jsonData = JSON.stringify(data, null, 2);
+      const blob = new Blob([jsonData], {type: 'application/json'});
+      const url = URL.createObjectURL(blob);
+      
+      // Create a temporary link and click it to download
+      const tempLink = document.createElement('a');
+      tempLink.href = url;
+      tempLink.download = `comment_analysis_${currentVideoId}.json`;
+      document.body.appendChild(tempLink);
+      tempLink.click();
+      document.body.removeChild(tempLink);
+      URL.revokeObjectURL(url);
+    };
+    
+    downloadContainer.appendChild(downloadLink);
+    visualizationsGrid.appendChild(downloadContainer);
   }
 });

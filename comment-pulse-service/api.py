@@ -80,32 +80,78 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Function to mount an analysis directory for static file serving
+# Function to ensure an analysis directory exists and is tracked
 def mount_analysis_directory(video_id: str):
     directory = f"analysis_{video_id}"
     try:
         # Check if directory exists
         if os.path.isdir(directory):
-            # Check if it's already mounted
-            if directory not in getattr(app, "_mounted_directories", set()):
-                app.mount(f"/{directory}", StaticFiles(directory=directory), name=directory)
-                # Keep track of mounted directories
-                if not hasattr(app, "_mounted_directories"):
-                    app._mounted_directories = set()
-                app._mounted_directories.add(directory)
-                logger.info(f"Mounted directory: {directory}")
+            # Keep track of mounted directories
+            if not hasattr(app, "_mounted_directories"):
+                app._mounted_directories = set()
+            app._mounted_directories.add(directory)
+            logger.info(f"Analysis directory available: {directory}")
             return True
         return False
     except Exception as e:
-        logger.error(f"Error mounting directory {directory}: {str(e)}")
+        logger.error(f"Error tracking directory {directory}: {str(e)}")
         return False
 
-# Mount existing analysis directories
-existing_dirs = [d for d in os.listdir() if d.startswith("analysis_") and os.path.isdir(d)]
-for directory in existing_dirs:
-    video_id = directory.replace("analysis_", "")
-    mount_analysis_directory(video_id)
-    logger.info(f"Mounted existing directory: {directory}")
+# Mount static files
+try:
+    app.mount('/static', StaticFiles(directory='static'), name='static')
+    logger.info("Mounted static directory")
+except Exception as e:
+    logger.warning(f"Could not mount static directory: {str(e)}")
+
+# Create static directory if it doesn't exist
+if not os.path.exists('static'):
+    try:
+        os.makedirs('static', exist_ok=True)
+        logger.info("Created static directory")
+    except Exception as e:
+        logger.warning(f"Could not create static directory: {str(e)}")
+
+# Create a single mount point for all analysis directories
+try:
+    # First, unmount any previously mounted directories to avoid conflicts
+    if hasattr(app, "_mounted_directories"):
+        for directory in list(app._mounted_directories):
+            try:
+                # We can't actually unmount in FastAPI, but we can remove it from our tracking
+                app._mounted_directories.remove(directory)
+                logger.info(f"Unmounted directory: {directory}")
+            except Exception as e:
+                logger.error(f"Error unmounting directory {directory}: {str(e)}")
+    
+    # Mount each analysis directory individually
+    try:
+        # First, mount the static directory
+        if os.path.exists('static'):
+            app.mount('/static', StaticFiles(directory='static'), name='static')
+            logger.info("Mounted static directory")
+        
+        # Then, mount each analysis directory individually
+        for directory in [d for d in os.listdir() if d.startswith("analysis_") and os.path.isdir(d)]:
+            try:
+                app.mount(f"/analysis/{directory}", StaticFiles(directory=directory), name=directory)
+                logger.info(f"Mounted analysis directory: {directory}")
+            except Exception as e:
+                logger.error(f"Error mounting directory {directory}: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error mounting directories: {str(e)}")
+    
+    # Initialize mounted directories tracking
+    if not hasattr(app, "_mounted_directories"):
+        app._mounted_directories = set()
+    
+    # Log all available analysis directories
+    existing_dirs = [d for d in os.listdir() if d.startswith("analysis_") and os.path.isdir(d)]
+    for directory in existing_dirs:
+        logger.info(f"Analysis directory available: {directory}")
+except Exception as e:
+    logger.warning(f"Error setting up analysis directories: {str(e)}")
+
 
 
 def convert_numpy_types(obj: Any) -> Any:
@@ -146,6 +192,13 @@ class AnalysisResults(BaseModel):
     average_sentiment_score: Union[float, np.float64]
     summary_paragraph: str
     visualizations: List[str]
+    
+    @field_validator('visualizations')
+    @classmethod
+    def validate_visualizations(cls, v: List[str]) -> List[str]:
+        """Ensure visualization paths are properly formatted."""
+        # Remove any duplicate slashes and ensure proper format
+        return [f"/analysis_{os.path.basename(path)}" if path.startswith('/') else f"/analysis_{path}" for path in v]
 
 class VideoAnalysisResponse(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -224,20 +277,40 @@ async def analyze_video(
         logger.info(f"Starting analysis for video {request.video_id}")
         logger.info(f"Parameters: days_back={request.days_back}, max_comments={request.max_comments}")
         
-        # Create output directory
+        # Create and mount analysis directory
         os.makedirs(output_dir, exist_ok=True)
-        logger.info(f"Created output directory: {output_dir}")
         
-        # Mount directory for static file serving
-        mount_analysis_directory(request.video_id)
+        # Track the analysis directory
+        if not hasattr(app, "_mounted_directories"):
+            app._mounted_directories = set()
+        app._mounted_directories.add(output_dir)
+        logger.info(f"Analysis directory created and tracked: {output_dir}")
         
-        # Default visualizations
-        visualizations = [
-            f"{output_dir}/sentiment_distribution.png",
-            f"{output_dir}/engagement_over_time.png",
-            f"{output_dir}/activity_heatmap.png",
-            f"{output_dir}/wordcloud.png"
+        # Default visualization filenames
+        visualization_files = [
+            "sentiment_distribution.png",
+            "engagement_over_time.png",
+            "activity_heatmap.png",
+            "wordcloud.png"
         ]
+        
+        # Check if the visualization files exist
+        existing_files = []
+        for filename in visualization_files:
+            file_path = os.path.join(output_dir, filename)
+            if os.path.exists(file_path):
+                existing_files.append(filename)
+                logger.info(f"Visualization file exists: {file_path}")
+            else:
+                logger.warning(f"Visualization file not found: {file_path}")
+        
+        # Build visualization URLs
+        visualizations = []
+        for filename in existing_files:
+            # Use relative path from root with proper encoding
+            relative_path = f"/analysis/{output_dir}/{filename}"
+            visualizations.append(relative_path)
+            logger.info(f"Added visualization URL: {relative_path}")
         
         # Initialize service and perform analysis
         try:
@@ -409,6 +482,45 @@ async def clear_cache(api_key: str = Depends(get_api_key)):
             detail=f"Error clearing cache: {str(e)}"
         )
 
+@app.delete("/cleanup/{video_id}")
+async def cleanup_analysis_directory(video_id: str):
+    """Delete the analysis directory for a specific video ID"""
+    try:
+        directory = f"analysis_{video_id}"
+        
+        # Check if directory exists
+        if os.path.isdir(directory):
+            # Unmount the directory if it was mounted
+            if hasattr(app, "_mounted_directories") and directory in app._mounted_directories:
+                # We can't actually unmount in FastAPI, but we can remove it from our tracking
+                app._mounted_directories.remove(directory)
+                logger.info(f"Unmounted directory: {directory}")
+            
+            # Remove all files in the directory
+            for filename in os.listdir(directory):
+                file_path = os.path.join(directory, filename)
+                try:
+                    if os.path.isfile(file_path):
+                        os.unlink(file_path)
+                        logger.info(f"Deleted file: {file_path}")
+                except Exception as e:
+                    logger.error(f"Error deleting file {file_path}: {str(e)}")
+            
+            # Remove the directory
+            os.rmdir(directory)
+            logger.info(f"Deleted directory: {directory}")
+            
+            return {"status": "success", "message": f"Analysis directory for video {video_id} deleted"}
+        else:
+            logger.warning(f"Directory {directory} does not exist")
+            return {"status": "warning", "message": f"Analysis directory for video {video_id} does not exist"}
+    except Exception as e:
+        logger.error(f"Error cleaning up analysis directory: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error cleaning up analysis directory: {str(e)}"
+        )
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler"""
@@ -421,7 +533,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 if __name__ == "__main__":
     # Get configuration from environment variables
     host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
+    port = int(os.getenv("PORT", 8000))
     log_level = os.getenv("LOG_LEVEL", "info").lower()
     
     # Print API key for initial setup

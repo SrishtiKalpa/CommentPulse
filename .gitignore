@@ -1,0 +1,14 @@
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# Analysis directories with generated content
+comment-pulse-service/analysis_*/
+
+# Static files
+comment-pulse-service/static/
+
+# Test files
+comment-pulse-service/test_viz.py
+comment-pulse-service/generate_viz.py
