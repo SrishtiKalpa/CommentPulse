@@ -111,60 +111,107 @@ function resetAnalysisState() {
 function cleanupResources() {
   console.log('[Drawer] Cleaning up resources...');
   
-  // Clear any pending timeouts
-  clearAnalysisTimeout();
-  
-  // Reset analysis state
-  resetAnalysisState();
-  
-  // Revoke any blob URLs we created
-  blobUrls.forEach(url => {
-    try {
-      URL.revokeObjectURL(url);
-      console.log('[Drawer] Revoked blob URL:', url);
-    } catch (e) {
-      console.error('[Drawer] Error revoking blob URL:', e);
-    }
-  });
-  blobUrls.clear();
-  
-  // Clear any charts
-  if (currentChart) {
-    try {
-      currentChart.destroy();
-      console.log('[Drawer] Destroyed chart instance');
-    } catch (e) {
-      console.error('[Drawer] Error destroying chart:', e);
-    }
-    currentChart = null;
+  // Prevent multiple simultaneous cleanups
+  if (resetInProgress) {
+    console.log('[Drawer] Cleanup already in progress, skipping');
+    return;
   }
   
-  // Clear the visualizations container
-  const container = document.getElementById('visualizations');
-  if (container) {
-    container.innerHTML = '';
-    console.log('[Drawer] Cleared visualizations container');
-  }
+  resetInProgress = true;
   
-  // Reset all state variables
-  isAnalyzing = false;
-  isAnalysisInProgress = false;
-  currentAnalysisId = null;
-  analysisStartTime = null;
-  resetInProgress = false;
-  
-  // Notify parent window about cleanup
   try {
-    window.parent.postMessage({
-      type: 'CLEANUP_RESOURCES',
-      timestamp: Date.now()
-    }, '*');
-    console.log('[Drawer] Sent cleanup notification to parent');
-  } catch (e) {
-    console.error('[Drawer] Error sending cleanup notification:', e);
+    // Clear any pending timeouts
+    clearAnalysisTimeout();
+    
+    // Reset analysis state
+    resetAnalysisState();
+    
+    // Revoke any blob URLs we created
+    const urlsToRevoke = new Set(blobUrls);
+    urlsToRevoke.forEach(url => {
+      try {
+        URL.revokeObjectURL(url);
+        console.log('[Drawer] Revoked blob URL:', url);
+        blobUrls.delete(url);
+      } catch (e) {
+        console.error('[Drawer] Error revoking blob URL:', e);
+      }
+    });
+    
+    // Clear any charts
+    if (currentChart) {
+      try {
+        const canvas = currentChart.canvas;
+        const parent = canvas?.parentNode;
+        
+        // Properly clean up Chart.js instance
+        currentChart.destroy();
+        console.log('[Drawer] Destroyed chart instance');
+        
+        // Remove canvas from DOM if it exists
+        if (parent && parent.contains(canvas)) {
+          parent.removeChild(canvas);
+        }
+      } catch (e) {
+        console.error('[Drawer] Error destroying chart:', e);
+      } finally {
+        currentChart = null;
+      }
+    }
+    
+    // Clear all visualization containers
+    const containers = [
+      document.getElementById('visualizations'),
+      document.getElementById('visualizations-grid'),
+      document.getElementById('results')
+    ];
+    
+    containers.forEach(container => {
+      if (container) {
+        try {
+          // Remove all child nodes
+          while (container.firstChild) {
+            container.removeChild(container.firstChild);
+          }
+          console.log(`[Drawer] Cleared container: ${container.id}`);
+        } catch (e) {
+          console.error(`[Drawer] Error clearing container ${container.id}:`, e);
+        }
+      }
+    });
+    
+    // Reset UI state
+    const loadingElement = document.getElementById('loading');
+    const errorElement = document.getElementById('error');
+    const resultsElement = document.getElementById('results');
+    
+    if (loadingElement) loadingElement.style.display = 'none';
+    if (errorElement) errorElement.style.display = 'none';
+    if (resultsElement) resultsElement.style.display = 'none';
+    
+    // Reset all state variables
+    isAnalyzing = false;
+    isAnalysisInProgress = false;
+    currentAnalysisId = null;
+    analysisStartTime = null;
+    
+    console.log('[Drawer] Cleanup complete');
+  } catch (error) {
+    console.error('[Drawer] Error during cleanup:', error);
+  } finally {
+    resetInProgress = false;
+    
+    // Notify parent window about cleanup completion
+    try {
+      window.parent.postMessage({
+        type: 'CLEANUP_COMPLETE',
+        timestamp: Date.now()
+      }, '*');
+      console.log('[Drawer] Sent cleanup complete notification to parent');
+    } catch (e) {
+      console.error('[Drawer] Error sending cleanup notification:', e);
+    }
   }
-  
-  console.log('[Drawer] Cleanup complete');
 }
 
 // Message queue processing
@@ -386,10 +433,41 @@ document.addEventListener('DOMContentLoaded', () => {
   }, 100);
   
   // Enhanced close button handler
-  closeButton.addEventListener('click', () => {
+  closeButton.addEventListener('click', async () => {
     console.log('[Drawer] Close button clicked, cleaning up...');
-    cleanupResources();
-    window.parent.postMessage({ type: 'CLOSE_DRAWER' }, '*');
+    
+    // Show loading state while cleaning up
+    const loadingElement = document.getElementById('loading');
+    if (loadingElement) {
+      loadingElement.style.display = 'flex';
+      const message = loadingElement.querySelector('p');
+      if (message) message.textContent = 'Closing...';
+    }
+    
+    try {
+      // Clean up resources first
+      await new Promise(resolve => {
+        const cleanupComplete = (event) => {
+          if (event.data && event.data.type === 'CLEANUP_COMPLETE') {
+            window.removeEventListener('message', cleanupComplete);
+            resolve();
+          }
+        };
+        
+        window.addEventListener('message', cleanupComplete);
+        cleanupResources();
+        
+        // Add a timeout in case cleanup takes too long
+        setTimeout(resolve, 2000);
+      });
+      
+      // Notify parent to close the drawer
+      window.parent.postMessage({ type: 'CLOSE_DRAWER' }, '*');
+    } catch (error) {
+      console.error('[Drawer] Error during close:', error);
+      // Still try to close even if cleanup fails
+      window.parent.postMessage({ type: 'CLOSE_DRAWER' }, '*');
+    }
   });
   
   // Add cleanup on beforeunload

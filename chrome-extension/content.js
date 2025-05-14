@@ -331,26 +331,61 @@ async function toggleDrawer() {
 function closeDrawer() {
   if (!drawer) return;
   
-  // Notify the drawer to clean up resources
-  drawer.contentWindow.postMessage({ type: 'CLEANUP_RESOURCES' }, '*');
+  console.log('[Content] Closing drawer...');
   
-  // Close the drawer
+  // Close the drawer first for better UX
   drawer.style.right = '-400px';
+  
+  // Then clean up resources after a short delay
+  setTimeout(() => {
+    cleanupResources();
+    // Notify the drawer to clean up its resources
+    if (drawer.contentWindow) {
+      drawer.contentWindow.postMessage({ type: 'CLEANUP_RESOURCES' }, '*');
+    }
+  }, 300); // Small delay to allow drawer to close smoothly
 }
 
-function cleanupResources() {
+async function cleanupResources() {
   console.log('[Content Script] Cleaning up resources');
   
   // Reset analysis state
   resetAnalysisState();
   
+  try {
+    // Send cleanup request to the backend
+    const videoId = getVideoId();
+    if (videoId) {
+      try {
+        const response = await fetch(`http://localhost:8000/cleanup/${videoId}`, {
+          method: 'DELETE',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        });
+        
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        const result = await response.json();
+        console.log('Cleanup result:', result);
+      } catch (error) {
+        console.error('Error cleaning up analysis folder:', error);
+      }
+    }
+  } catch (error) {
+    console.error('Error during cleanup:', error);
+  }
+  
   // Clean up any blob URLs
   if (window.URL) {
-    const images = document.querySelectorAll('.visualization-container img');
+    const images = document.querySelectorAll('.visualization-container img, #visualizations img');
     images.forEach(img => {
       if (img.src && img.src.startsWith('blob:')) {
         try {
           URL.revokeObjectURL(img.src);
+          console.log('Revoked blob URL:', img.src);
         } catch (e) {
           console.error('Error revoking blob URL:', e);
         }
@@ -358,7 +393,7 @@ function cleanupResources() {
     });
   }
   
-  // Clear the visualizations container
+  // Clear the visualizations container in the drawer
   if (drawer && drawer.contentDocument) {
     const container = drawer.contentDocument.getElementById('visualizations');
     if (container) {
@@ -710,6 +745,13 @@ async function handleAnalyzeRequest({ requestId, timestamp }) {
 // Listen for messages from both the page and the extension
 window.addEventListener('message', (event) => {
   console.log('[Content Script] Received window message:', event.data, 'from:', event.origin);
+  
+  // Handle close drawer message from the drawer
+  if (event.data && event.data.type === 'CLOSE_DRAWER') {
+    console.log('[Content] Received CLOSE_DRAWER message');
+    closeDrawer();
+    return;
+  }
   
   // Handle timeout notifications from drawer
   if (event.data && event.data.type === 'ANALYSIS_TIMED_OUT') {
