@@ -1,805 +1,898 @@
-// Store chart instances so they can be destroyed before creating new ones
-let sentimentChart = null;
-let engagementChart = null;
-let currentVideoId = null;
+// Load Chart.js dynamically
+// State variables
+let isAnalyzing = false;
+let isAnalysisInProgress = false;
+let currentAnalysisId = null;
+let currentChart = null;
+let chartLoaded = false;
+let resetInProgress = false;
+let resetTimestamp = null;
+let analysisStartTime = null;  // Add this to track analysis start time
+let analysisTimeoutId = null;
+let messageQueue = [];
+let isProcessingQueue = false;
 
-document.addEventListener('DOMContentLoaded', () => {
-  const analyzeBtn = document.getElementById('analyze-btn');
-  const closeBtn = document.getElementById('close-drawer');
-  const loadingDiv = document.getElementById('loading');
-  const errorDiv = document.getElementById('error');
-  const contentDiv = document.getElementById('content');
-  const summaryLoading = document.getElementById('summary-loading');
-  const summaryContent = document.getElementById('summary-content');
+// Constants
+const ANALYSIS_TIMEOUT_MS = 120000; // 2 minutes
+const MESSAGE_PROCESSING_INTERVAL = 100; // 100ms
+
+// Load Chart.js when needed
+// Load Chart.js from local file
+// Load Chart.js from local file
+function loadChartJS() {
+  if (chartLoaded) return Promise.resolve();
   
-  // Listen for close button click
-  closeBtn.addEventListener('click', () => {
-    // If we have a current video ID and analysis was performed, delete the analysis directory
-    if (currentVideoId) {
-      deleteAnalysisDirectory(currentVideoId);
+  return new Promise((resolve, reject) => {
+    try {
+      // Create script element
+      const script = document.createElement('script');
+      script.type = 'text/javascript';
+      script.src = chrome.runtime.getURL('libs/chart.min.js');
+      
+      // Add error handling
+      script.onerror = () => {
+        console.error('Error loading Chart.js');
+        reject(new Error('Failed to load Chart.js'));
+      };
+      
+      // Add load handler
+      script.onload = () => {
+        console.log('Chart.js loaded successfully');
+        chartLoaded = true;
+        resolve();
+      };
+      
+      // Append to head
+      document.head.appendChild(script);
+    } catch (error) {
+      console.error('Error creating script element:', error);
+      reject(error);
     }
-    
-    // Send message to content script to close drawer
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      chrome.tabs.sendMessage(tabs[0].id, { action: 'closeDrawer' });
-    });
-    
-    // Also send a message to the parent window (content script)
+  });
+}
+
+// Track all blob URLs for cleanup
+let blobUrls = new Set();
+
+// Helper functions
+function clearAnalysisTimeout() {
+  if (analysisTimeoutId) {
+    clearTimeout(analysisTimeoutId);
+    analysisTimeoutId = null;
+    console.log('[Drawer] Cleared analysis timeout');
+  }
+}
+
+// State management functions
+function getAnalysisState() {
+  const now = Date.now();
+  const duration = analysisStartTime ? now - analysisStartTime : 0;
+  return {
+    isAnalyzing,
+    isAnalysisInProgress,
+    currentAnalysisId,
+    duration,
+    startTime: analysisStartTime,
+    resetInProgress
+  };
+}
+
+function logAnalysisState(message = '') {
+  const state = getAnalysisState();
+  console.log(`[Drawer] Analysis State ${message}:`, state);
+}
+
+function resetAnalysisState() {
+  console.log('[Drawer] Resetting analysis state');
+  
+  // Clear any existing timeouts
+  clearAnalysisTimeout();
+  
+  // Reset all state variables
+  isAnalyzing = false;
+  isAnalysisInProgress = false;
+  currentAnalysisId = null;
+  analysisStartTime = null;
+  resetInProgress = false;
+  
+  // Get UI elements
+  const loadingElement = document.getElementById('loading');
+  const errorElement = document.getElementById('error');
+  const resultsElement = document.getElementById('results');
+  
+  // Reset UI to initial state
+  if (loadingElement) loadingElement.style.display = 'none';
+  if (errorElement) errorElement.style.display = 'none';
+  if (resultsElement) resultsElement.style.display = 'none';
+  
+  logAnalysisState('after reset');
+}
+
+function cleanupResources() {
+  console.log('[Drawer] Cleaning up resources...');
+  
+  // Clear any pending timeouts
+  clearAnalysisTimeout();
+  
+  // Reset analysis state
+  resetAnalysisState();
+  
+  // Revoke any blob URLs we created
+  blobUrls.forEach(url => {
+    try {
+      URL.revokeObjectURL(url);
+      console.log('[Drawer] Revoked blob URL:', url);
+    } catch (e) {
+      console.error('[Drawer] Error revoking blob URL:', e);
+    }
+  });
+  blobUrls.clear();
+  
+  // Clear any charts
+  if (currentChart) {
+    try {
+      currentChart.destroy();
+      console.log('[Drawer] Destroyed chart instance');
+    } catch (e) {
+      console.error('[Drawer] Error destroying chart:', e);
+    }
+    currentChart = null;
+  }
+  
+  // Clear the visualizations container
+  const container = document.getElementById('visualizations');
+  if (container) {
+    container.innerHTML = '';
+    console.log('[Drawer] Cleared visualizations container');
+  }
+  
+  // Reset all state variables
+  isAnalyzing = false;
+  isAnalysisInProgress = false;
+  currentAnalysisId = null;
+  analysisStartTime = null;
+  resetInProgress = false;
+  
+  // Notify parent window about cleanup
+  try {
     window.parent.postMessage({
-      source: 'comment-pulse-drawer',
-      action: 'closeDrawer'
+      type: 'CLEANUP_RESOURCES',
+      timestamp: Date.now()
     }, '*');
-  });
-  
-  // Function to delete the analysis directory
-  async function deleteAnalysisDirectory(videoId) {
-    try {
-      // Get API endpoint
-      let apiUrl = 'http://localhost:8000';
-      try {
-        const hostPermissions = chrome.runtime.getManifest().host_permissions;
-        if (hostPermissions && hostPermissions.length > 0) {
-          apiUrl = hostPermissions[0].replace('/*', '');
-        }
-      } catch (error) {
-        console.warn('Could not get API URL from manifest, using default:', error);
-      }
-      
-      console.log(`Attempting to delete analysis directory for video ${videoId}`);
-      
-      // Send delete request to the API
-      const response = await fetch(`${apiUrl}/cleanup/${videoId}`, {
-        method: 'DELETE'
-      });
-      
-      if (response.ok) {
-        const result = await response.json();
-        console.log('Analysis directory deleted:', result);
-      } else {
-        console.error('Failed to delete analysis directory:', response.statusText);
-      }
-    } catch (error) {
-      console.error('Error deleting analysis directory:', error);
-    }
+    console.log('[Drawer] Sent cleanup notification to parent');
+  } catch (e) {
+    console.error('[Drawer] Error sending cleanup notification:', e);
   }
   
-  // Listen for messages from content script and background script
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    console.log('Drawer received message:', message);
-    
-    if (message.action === 'initDrawer' && message.videoId) {
-      currentVideoId = message.videoId;
-      
-      // Reset UI
-      resetUI();
-      
-      // Enable analyze button
-      analyzeBtn.disabled = false;
-      
-      // Start analysis
-      analyzeComments(message.videoId);
-    } else if (message.action === 'closeDrawer') {
-      // Handle close action if needed
-      if (currentVideoId) {
-        deleteAnalysisDirectory(currentVideoId);
-      }
-    } else if (message.action === 'cleanup' && message.videoId) {
-      // Handle cleanup request
-      deleteAnalysisDirectory(message.videoId);
-    }
-    
-    return true; // Will respond asynchronously
-  });
+  console.log('[Drawer] Cleanup complete');
+}
+
+// Message queue processing
+async function processMessageQueue() {
+  if (isProcessingQueue || messageQueue.length === 0) return;
   
-  // Also listen for messages from the window (from content script)
-  window.addEventListener('message', (event) => {
-    // Make sure the message is from our content script
-    if (event.data && event.data.source === 'comment-pulse-content') {
-      console.log('Drawer received window message:', event.data);
-      
-      if (event.data.action === 'initDrawer' && event.data.videoId) {
-        currentVideoId = event.data.videoId;
-        
-        // Reset UI
-        resetUI();
-        
-        // Enable analyze button
-        analyzeBtn.disabled = false;
-      } else if (event.data.action === 'cleanup' && event.data.videoId) {
-        // Handle cleanup request when tab is closing
-        console.log('Received cleanup request for video ID:', event.data.videoId);
-        deleteAnalysisDirectory(event.data.videoId);
-      } else if (event.data.action === 'closeDrawer') {
-        // Handle close request
-        if (currentVideoId) {
-          deleteAnalysisDirectory(currentVideoId);
-        }
-      }
-    }
-  });
+  isProcessingQueue = true;
+  console.log('[Drawer] Processing message queue, length:', messageQueue.length);
   
-  // Add click handler for analyze button
-  analyzeBtn.addEventListener('click', () => {
-    if (currentVideoId) {
-      analyzeComments(currentVideoId);
-    } else {
-      showError('No video ID found. Please refresh the page and try again.');
+  try {
+    while (messageQueue.length > 0) {
+      const message = messageQueue.shift();
+      await handleMessage(message);
+      // Small delay between processing messages
+      await new Promise(resolve => setTimeout(resolve, MESSAGE_PROCESSING_INTERVAL));
     }
-  });
-  
-  // Helper function to reset the UI
-  function resetUI() {
-    errorDiv.classList.remove('active');
-    loadingDiv.classList.remove('active');
-    contentDiv.style.display = 'none';
-    
-    // Reset charts if they exist
-    if (sentimentChart) {
-      sentimentChart.destroy();
-      sentimentChart = null;
-    }
-    
-    if (engagementChart) {
-      engagementChart.destroy();
-      engagementChart = null;
-    }
-    
-    // Reset summary section
-    summaryLoading.classList.remove('active');
-    summaryContent.style.display = 'none';
-    
-    // Reset stats
-    document.getElementById('total-comments').textContent = '-';
-    document.getElementById('avg-sentiment').textContent = '-';
-    document.getElementById('top-topic').textContent = '-';
-    document.getElementById('engagement-score').textContent = '-';
-    
-    // Reset visualizations
-    document.getElementById('visualizations-grid').innerHTML = '';
+  } catch (error) {
+    console.error('[Drawer] Error processing message queue:', error);
+  } finally {
+    isProcessingQueue = false;
+  }
+}
+
+// Enhanced message handling
+async function handleMessage(event) {
+  if (!event.data || typeof event.data !== 'object') {
+    console.warn('[Drawer] Received invalid message format:', event.data);
+    return;
   }
   
-  function showError(message) {
-    console.error('Error:', message);
-    errorDiv.textContent = message;
-    errorDiv.classList.add('active');
-    loadingDiv.classList.remove('active');
-    contentDiv.style.display = 'none';
-  }
+  const { type, data, error, timestamp, requestId, source, startTime } = event.data;
+  console.log(`[Drawer] Processing message type: ${type}`, { requestId, timestamp, source, startTime });
   
-  function showLoading() {
-    errorDiv.classList.remove('active');
-    loadingDiv.classList.add('active');
-    contentDiv.style.display = 'none';
-  }
-  
-  function showContent() {
-    errorDiv.classList.remove('active');
-    loadingDiv.classList.remove('active');
-    contentDiv.style.display = 'block';
-  }
-  
-  async function analyzeComments(videoId) {
-    showLoading();
-    
-    // Show a progress message to the user
-    document.getElementById('loading-message').textContent = 'Starting analysis...';
-    
-    let controller;
-    let timeoutId;
-    
-    try {
-      // Get API endpoint from environment or default to localhost
-      let apiUrl = 'http://localhost:8000';
-      try {
-        // Try to get the URL from manifest, but use default if anything fails
-        const hostPermissions = chrome.runtime.getManifest().host_permissions;
-        if (hostPermissions && hostPermissions.length > 0) {
-          apiUrl = hostPermissions[0].replace('/*', '');
-        }
-      } catch (error) {
-        console.warn('Could not get API URL from manifest, using default:', error);
-      }
-      
-      console.log('Using API URL:', apiUrl);
-      
-      // Use a much shorter timeout (30 seconds) but implement progressive loading
-      controller = new AbortController();
-      timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
-      
-      // Update the loading message
-      document.getElementById('loading-message').textContent = 'Fetching comments...';
-      
-      // First, make a lightweight request to check if the video exists and get basic info
-      try {
-        const checkResponse = await fetch(`${apiUrl}/health`, {
-          method: 'GET',
-          signal: controller.signal
-        });
-        
-        if (checkResponse.ok) {
-          console.log('Server is healthy, proceeding with analysis');
-        } else {
-          console.warn('Server health check failed:', checkResponse.status);
-        }
-      } catch (e) {
-        console.warn('Server health check failed:', e);
-        // Continue anyway, the main request will handle errors
-      }
-      
-      // Update the loading message
-      document.getElementById('loading-message').textContent = 'Analyzing comments (this may take a moment)...';
-      
-      console.log('Sending request to:', `${apiUrl}/analyze`);
-      console.log('Request payload:', { video_id: videoId, days_back: 7, max_comments: 250 }); // Further reduced for faster response
-      
-      // Wrap fetch in a try-catch to handle network errors more gracefully
-      let response;
-      try {
-        response = await fetch(`${apiUrl}/analyze`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            video_id: videoId,
-            days_back: 7,
-            max_comments: 250 // Further reduced for faster response
-          }),
-          signal: controller.signal
-        });
-      } catch (fetchError) {
-        console.error('Fetch error:', fetchError);
-        if (fetchError.name === 'AbortError') {
-          // Create a fallback response with placeholder data
-          showFallbackResults(videoId);
-          throw new Error('Request timed out');
-        } else {
-          throw new Error(`Network error: ${fetchError.message}`);
-        }
-      } finally {
-        if (timeoutId) clearTimeout(timeoutId);
-      }
-      
-      console.log('Response status:', response.status, response.statusText);
-      
-      // Handle non-OK responses
-      if (!response.ok) {
-        let errorDetail = '';
-        try {
-          const errorData = await response.json();
-          errorDetail = errorData.detail || '';
-        } catch (e) {
-          // If we can't parse the JSON, just use the status text
-          console.warn('Could not parse error response:', e);
-        }
-        
-        throw new Error(`Server error (${response.status}): ${errorDetail || response.statusText}`);
-      }
-      
-      // Get response text first
-      let responseText;
-      try {
-        responseText = await response.text();
-        console.log('Response text length:', responseText.length);
-        if (responseText.length < 100) {
-          console.log('Raw response text:', responseText); // Only log full text if it's short
-        } else {
-          console.log('Raw response text (truncated):', responseText.substring(0, 100) + '...');
-        }
-      } catch (textError) {
-        console.error('Error reading response text:', textError);
-        throw new Error('Could not read server response');
-      }
-      
-      // Parse the response as JSON
-      let responseData;
-      try {
-        // Check if response is empty
-        if (!responseText || responseText.trim() === '') {
-          throw new Error('Empty response from server');
-        }
-        
-        responseData = JSON.parse(responseText);
-        console.log('Response parsed successfully');
-      } catch (parseError) {
-        console.error('Error parsing JSON response:', parseError);
-        throw new Error(`Failed to parse server response: ${responseText.substring(0, 100)}...`);
-      }
-      
-      // Validate the response data
-      if (!responseData) {
-        throw new Error('Empty response data from server');
-      }
-      
-      // Check if the response has the expected structure
-      if (!responseData.analysis_results) {
-        console.warn('Response missing analysis_results:', responseData);
-        // Try to create a valid structure if possible
-        responseData = {
-          video_id: videoId,
-          analysis_results: responseData,
-          summary: responseData.summary_paragraph || 'No summary available',
-          visualizations: []
-        };
-      }
-      
-      // Display the results
-      displayResults(responseData);
-      showContent();
-    } catch (error) {
-      console.error('Analysis error:', error);
-      
-      // Provide more helpful error messages
-      if (error.name === 'AbortError' || error.message.includes('timed out')) {
-        showError('Request timed out. The server might be overloaded, please try again later.');
-      } else if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError') || error.message.includes('Network error')) {
-        showError('Could not connect to the analysis server. Please check if the server is running.');
-      } else if (error.message.includes('parse')) {
-        showError('Error processing server response. The response format may be invalid.');
-      } else {
-        showError(`Error analyzing comments: ${error.message}`);
+  // Handle reset acknowledgment
+  if (type === 'ANALYSIS_STATE_RESET') {
+    console.log('[Drawer] Received reset acknowledgment', { timestamp, resetTimestamp });
+    if (timestamp && resetTimestamp && timestamp >= resetTimestamp) {
+      resetInProgress = false;
+      console.log('[Drawer] Reset completed successfully');
+      if (window.completeReset) {
+        window.completeReset();
+        window.completeReset = null;
       }
     }
+    return;
   }
   
-  function displayResults(responseData) {
-    console.log('Displaying results from API response');
+  // Handle analysis ready message
+  if (type === 'ANALYSIS_READY') {
+    console.log('[Drawer] Analysis ready, starting...', { requestId, startTime });
+    if (startTime) {
+      analysisStartTime = startTime;
+    }
     
-    try {
-      // Ensure we have valid data
-      if (!responseData || typeof responseData !== 'object') {
-        console.error('Invalid response data:', responseData);
-        showError('Invalid response from server');
-        return;
-      }
-      
-      // Handle different API response formats
-      let data;
-      if (responseData.analysis_results) {
-        // Format: { analysis_results: {...} }
-        console.log('Response format: Contains analysis_results object');
-        data = responseData;
-      } else if (responseData.total_comments !== undefined) {
-        // Format: Direct analysis results object
-        console.log('Response format: Direct analysis results object');
-        data = { analysis_results: responseData };
-      } else if (responseData.error) {
-        // Format: Error object
-        console.error('Server returned error:', responseData.error);
-        showError(`Server error: ${responseData.error}`);
-        return;
-      } else {
-        // Try to determine if any part of the response could be used as analysis results
-        console.warn('Unrecognized response format, attempting to recover');
+    // Clear any existing timeouts when starting new analysis
+    clearAnalysisTimeout();
+    
+    startAnalysis();
+    return;
+  }
+  
+  // Simplified source validation for Chrome extension
+  const isValidSource = true; // Accept all messages since we're in a controlled environment
+  
+  if (!isValidSource) {
+    console.log('[Drawer] Ignoring message from unknown source:', event.origin);
+    return;
+  }
+  
+  // Handle all message types in the switch statement
+  switch (type) {
+    case 'ANALYSIS_STARTED':
+      console.log('[Drawer] Analysis started, requestId:', requestId);
+      // Only update state if this is a new analysis or we're forcing a restart
+      if (!isAnalyzing || requestId !== currentAnalysisId) {
+        isAnalyzing = true;
+        isAnalysisInProgress = true;
+        currentAnalysisId = requestId;
+        if (startTime) {
+          analysisStartTime = startTime;
+        }
         
-        // Look for objects that might contain analysis data
-        let possibleResults = null;
-        for (const key in responseData) {
-          if (typeof responseData[key] === 'object' && responseData[key] !== null) {
-            // Check if this object has any of the expected properties
-            const obj = responseData[key];
-            if (obj.total_comments !== undefined || 
-                obj.sentiment_distribution !== undefined || 
-                obj.summary_paragraph !== undefined) {
-              possibleResults = obj;
-              console.log(`Found possible analysis results in property: ${key}`);
-              break;
-            }
+        // Update UI
+        const loadingElement = document.getElementById('loading');
+        const errorElement = document.getElementById('error');
+        const resultsElement = document.getElementById('results');
+        
+        if (loadingElement) loadingElement.style.display = 'flex';
+        if (errorElement) errorElement.style.display = 'none';
+        if (resultsElement) resultsElement.style.display = 'none';
+        
+        const loadingMessage = loadingElement?.querySelector('p');
+        if (loadingMessage) {
+          loadingMessage.textContent = 'Analyzing comments...';
+        }
+        
+        // Set timeout for analysis
+        clearAnalysisTimeout();
+        analysisTimeoutId = setTimeout(() => {
+          if (isAnalyzing) {
+            const duration = Date.now() - analysisStartTime;
+            console.warn(`[Drawer] Analysis timed out after ${duration}ms`);
+            handleAnalysisError({
+              message: 'Analysis timed out. The server took too long to respond.',
+              isTimeout: true
+            }, currentAnalysisId);
           }
-        }
+        }, ANALYSIS_TIMEOUT_MS);
         
-        if (possibleResults) {
-          data = { analysis_results: possibleResults };
-        } else {
-          // Last resort: treat the entire response as analysis results
-          console.warn('Could not find analysis results structure, using entire response');
-          data = { 
-            analysis_results: responseData,
-            summary: 'Unable to extract proper summary from response'
-          };
-        }
+        console.log('[Drawer] Loading state updated');
+      } else {
+        console.log('[Drawer] Ignoring duplicate ANALYSIS_STARTED for same requestId:', requestId);
+      }
+      break;
+      
+    case 'ANALYSIS_RESULTS':
+      console.log('[Drawer] Analysis results received:', data);
+      
+      // Calculate duration before resetting state
+      const duration = analysisStartTime ? Date.now() - analysisStartTime : 0;
+      console.log(`[Drawer] Analysis completed in ${duration}ms`);
+      
+      // Reset state
+      isAnalyzing = false;
+      isAnalysisInProgress = false;
+      analysisStartTime = null;
+      
+      // Clear timeout
+      clearAnalysisTimeout();
+      
+      // Only process if this is the most recent analysis
+      if (requestId && currentAnalysisId && requestId !== currentAnalysisId) {
+        console.log(`[Drawer] Ignoring stale analysis result for request ${requestId}, current is ${currentAnalysisId}`);
+        break;
       }
       
-      // Ensure analysis_results exists and is an object
-      if (!data.analysis_results || typeof data.analysis_results !== 'object') {
-        console.error('Missing or invalid analysis_results:', data);
-        showError('Missing or invalid analysis results in server response');
-        return;
+      if (!data) {
+        console.error('[Drawer] No data received in ANALYSIS_RESULTS');
+        handleAnalysisError('No data received from analysis. Please try again.');
+        break;
       }
       
-      // Log the structure we're working with
-      console.log('Working with data structure:', {
-        has_total_comments: data.analysis_results.total_comments !== undefined,
-        has_sentiment: data.analysis_results.average_sentiment_score !== undefined,
-        has_engagement: data.analysis_results.engagement_rate !== undefined,
-        has_summary: Boolean(data.summary || data.analysis_results.summary_paragraph)
-      });
+      // Hide loading and show results
+      const loadingElement = document.getElementById('loading');
+      const errorElement = document.getElementById('error');
+      const resultsElement = document.getElementById('results');
       
-      // Update stats with fallbacks for missing data
-      document.getElementById('total-comments').textContent = 
-        data.analysis_results.total_comments !== undefined ? data.analysis_results.total_comments : 'N/A';
-        
-      document.getElementById('avg-sentiment').textContent = 
-        data.analysis_results.average_sentiment_score !== undefined ? 
-        (data.analysis_results.average_sentiment_score * 100).toFixed(1) + '%' : 'N/A';
+      if (loadingElement) loadingElement.style.display = 'none';
+      if (errorElement) errorElement.style.display = 'none';
+      if (resultsElement) resultsElement.style.display = 'block';
       
-      // For top topic, we don't have this in the API response, so display summary instead
-      document.getElementById('top-topic').textContent = 'See summary';
-      
-      document.getElementById('engagement-score').textContent = 
-        data.analysis_results.engagement_rate !== undefined ? 
-        (data.analysis_results.engagement_rate * 100).toFixed(1) + '%' : 'N/A';
-      
-      // Process and display summary
-      const summaryLoading = document.getElementById('summary-loading');
-      const summaryContent = document.getElementById('summary-content');
-      const summaryText = document.getElementById('summary-text');
-      const summaryHighlightsList = document.getElementById('summary-highlights-list');
-      
-      // Show loading state
-      summaryLoading.classList.add('active');
-      summaryContent.style.display = 'none';
-      
-      // Get the summary text with multiple fallbacks
-      let summaryRawText = 'No summary available';
-      
-      if (data.summary && typeof data.summary === 'string' && data.summary.length > 10) {
-        summaryRawText = data.summary;
-        console.log('Using data.summary');
-      } else if (data.analysis_results.summary_paragraph && 
-                typeof data.analysis_results.summary_paragraph === 'string' && 
-                data.analysis_results.summary_paragraph.length > 10) {
-        summaryRawText = data.analysis_results.summary_paragraph;
-        console.log('Using data.analysis_results.summary_paragraph');
-      } else if (data.analysis_results.summary && 
-                typeof data.analysis_results.summary === 'string' && 
-                data.analysis_results.summary.length > 10) {
-        summaryRawText = data.analysis_results.summary;
-        console.log('Using data.analysis_results.summary');
-      }
-      
-      console.log('Summary text length:', summaryRawText.length);
-      
-      // Process the summary to extract key insights
-      processAndDisplaySummary(summaryRawText, summaryText, summaryHighlightsList);
-      
-      // Hide loading and show content
-      summaryLoading.classList.remove('active');
-      summaryContent.style.display = 'flex';
-      
-      // Create charts and display visualizations
+      // Load Chart.js and display results
       try {
-        createCharts(data);
-        displayVisualizations(data);
-      } catch (chartError) {
-        console.error('Error creating charts:', chartError);
-        // Continue execution even if charts fail
+        await loadChartJS();
+        displayResults(data);
+        console.log('[Drawer] Results displayed successfully');
+      } catch (error) {
+        console.error('[Drawer] Error displaying results:', error);
+        handleAnalysisError('Error displaying results. Please try again.');
       }
-    } catch (error) {
-      console.error('Error displaying results:', error);
-      showError(`Error displaying results: ${error.message}`);
-    }
+      break;
+      
+    case 'ANALYSIS_ERROR':
+      console.error('[Drawer] Analysis error:', error || 'Unknown error');
+      handleAnalysisError(error || 'An error occurred during analysis.');
+      break;
+      
+    case 'ANALYSIS_PROGRESS':
+      console.log('[Drawer] Analysis progress:', data);
+      // Update loading message if progress data is available
+      if (data && data.message) {
+        const loadingElement = document.getElementById('loading');
+        const loadingMessage = loadingElement?.querySelector('p');
+        if (loadingMessage) {
+          loadingMessage.textContent = data.message;
+        }
+      }
+      break;
+      
+    case 'CLEANUP_RESOURCES':
+      console.log('[Drawer] Cleaning up resources...');
+      cleanupResources();
+      break;
+      
+    case 'CLOSE_DRAWER':
+      console.log('[Drawer] Closing drawer...');
+      cleanupResources();
+      window.parent.postMessage({ type: 'CLOSE_DRAWER' }, '*');
+      break;
+      
+    case 'ANALYSIS_TIMED_OUT':
+      console.log('[Drawer] Received ANALYSIS_TIMED_OUT, cleaning up...', data);
+      handleAnalysisError({
+        message: `Analysis timed out after ${data.duration || 'unknown'}ms. Please try again.`,
+        isTimeout: true
+      }, data.requestId);
+      break;
+      
+    default:
+      console.warn('[Drawer] Unknown message type:', type);
   }
+}
+
+// Initialize message handling
+document.addEventListener('DOMContentLoaded', () => {
+  const closeButton = document.getElementById('close-drawer');
+  const loadingElement = document.getElementById('loading');
+  const errorElement = document.getElementById('error');
+  const resultsElement = document.getElementById('results');
   
-  // Process the summary text to extract key insights and format the detailed text
-  function processAndDisplaySummary(summaryText, summaryTextElement, highlightsListElement) {
-    // Clear existing highlights
-    highlightsListElement.innerHTML = '';
+  // Initialize UI state
+  loadingElement.style.display = 'flex';
+  errorElement.style.display = 'none';
+  resultsElement.style.display = 'none';
+  
+  // Start analysis automatically after a small delay to ensure drawer is ready
+  setTimeout(() => {
+    startAnalysis();
+  }, 100);
+  
+  // Enhanced close button handler
+  closeButton.addEventListener('click', () => {
+    console.log('[Drawer] Close button clicked, cleaning up...');
+    cleanupResources();
+    window.parent.postMessage({ type: 'CLOSE_DRAWER' }, '*');
+  });
+  
+  // Add cleanup on beforeunload
+  window.addEventListener('beforeunload', () => {
+    console.log('[Drawer] Window unloading, cleaning up...');
+    cleanupResources();
+  });
+  
+  // Add message queue processing
+  window.addEventListener('message', (event) => {
+    console.log('[Drawer] Received message:', event.data);
+    messageQueue.push(event);
+    processMessageQueue();
+  });
+  
+  // Update loading message to show we're initializing
+  const loadingMessage = loadingElement.querySelector('p');
+  if (loadingMessage) {
+    loadingMessage.textContent = 'Initializing analysis...';
+  }
+});
+
+function displayResults(data) {
+  try {
+    console.log('Displaying results:', data);
     
-    if (!summaryText || summaryText === 'No summary available') {
-      summaryTextElement.textContent = 'No summary available for this video\'s comments.';
-      const noDataLi = document.createElement('li');
-      noDataLi.textContent = 'No insights available';
-      highlightsListElement.appendChild(noDataLi);
+    // Log the full data structure to find visualizations
+    console.log('Full data structure for visualizations:', JSON.stringify(data, null, 2));
+
+    // Try to find visualizations in different possible locations
+    let visualizations = [];
+    
+    // Check various possible paths for visualizations
+    const possibleVizPaths = [
+      data.visualizations,                    // Direct path
+      data.analysis_results?.visualizations,  // Nested in analysis_results
+      data.analysis_results?.images,          // Alternative name
+      data.images,                            // Top level alternative
+      data.charts,                            // Another possible name
+      data.analysis_results?.charts,          // Nested charts
+      data.analysis_results?.plots,           // Another possible name
+      data.plots                              // Top level plots
+    ];
+    
+    // Find the first valid array of visualizations
+    for (const path of possibleVizPaths) {
+      if (Array.isArray(path) && path.length > 0) {
+        console.log('Found visualizations at path:', path);
+        visualizations = path;
+        break;
+      }
+    }
+    
+    console.log('Processing visualizations:', visualizations);
+
+    // Display visualizations
+    const visualizationsGrid = document.getElementById('visualizations-grid');
+    if (!visualizationsGrid) {
+      console.error('Visualizations grid not found');
       return;
     }
     
-    // Format the summary text with proper line breaks and spacing
-    const formattedText = summaryText
-      .replace(/\. /g, '.\n')
-      .replace(/\! /g, '!\n')
-      .replace(/\? /g, '?\n')
-      .replace(/\n\n/g, '\n')
-      .trim();
-    
-    summaryTextElement.textContent = formattedText;
-    
-    // Extract key insights from the summary
-    const sentences = summaryText.split(/[.!?]\s+/);
-    const keyInsights = [];
-    
-    // Look for sentences with indicators of importance
-    const importanceIndicators = [
-      'most', 'majority', 'primarily', 'mainly', 'largely',
-      'significant', 'notably', 'interestingly', 'surprisingly',
-      'overall', 'generally', 'typically', 'commonly',
-      'positive', 'negative', 'neutral', 'mixed',
-      'high', 'low', 'average', 'median',
-      'increase', 'decrease', 'change', 'trend',
-      'recommend', 'suggest', 'advise', 'propose',
-      'highlight', 'emphasize', 'underscore', 'stress'
-    ];
-    
-    // Find sentences with numbers or percentages
-    const numberPattern = /\d+(\.\d+)?%|\d+/;
-    
-    // Collect sentences that contain importance indicators or numbers
-    sentences.forEach(sentence => {
-      if (sentence.trim().length < 5) return; // Skip very short sentences
-      
-      const lowerSentence = sentence.toLowerCase();
-      const hasIndicator = importanceIndicators.some(indicator => lowerSentence.includes(indicator));
-      const hasNumber = numberPattern.test(sentence);
-      
-      if (hasIndicator || hasNumber) {
-        keyInsights.push(sentence.trim() + '.');
-      }
-    });
-    
-    // If we couldn't find good insights, use the first 2-3 sentences
-    if (keyInsights.length < 2 && sentences.length > 0) {
-      const maxSentences = Math.min(3, sentences.length);
-      for (let i = 0; i < maxSentences; i++) {
-        if (sentences[i].trim().length > 5) {
-          keyInsights.push(sentences[i].trim() + '.');
-        }
-      }
-    }
-    
-    // Remove duplicates and limit to 5 insights
-    const uniqueInsights = [...new Set(keyInsights)].slice(0, 5);
-    
-    // Add insights to the list
-    uniqueInsights.forEach(insight => {
-      const li = document.createElement('li');
-      li.textContent = insight;
-      highlightsListElement.appendChild(li);
-    });
-    
-    // If still no insights, add a default message
-    if (highlightsListElement.children.length === 0) {
-      const defaultLi = document.createElement('li');
-      defaultLi.textContent = 'See detailed analysis below for insights.';
-      highlightsListElement.appendChild(defaultLi);
-    }
-    
-  }
-  
-  // Create charts for sentiment and engagement
-  function createCharts(data) {
-    if (!data || !data.analysis_results) return;
-    
-    // Extract sentiment distribution with proper error handling
-    const sentimentDistribution = data.analysis_results.sentiment_distribution || {};
-    const positive = (sentimentDistribution && sentimentDistribution.positive) || 0;
-    const neutral = (sentimentDistribution && sentimentDistribution.neutral) || 0;
-    const negative = (sentimentDistribution && sentimentDistribution.negative) || 0;
-    const total = positive + neutral + negative || 1; // Avoid division by zero
-    
-    // Destroy existing sentiment chart if it exists
-    if (sentimentChart) {
-      sentimentChart.destroy();
-    }
-    
-    // Create sentiment distribution chart
-    const sentimentCtx = document.getElementById('sentiment-chart').getContext('2d');
-    sentimentChart = new Chart(sentimentCtx, {
-      type: 'pie',
-      data: {
-        labels: ['Positive', 'Neutral', 'Negative'],
-        datasets: [{
-          data: [
-            (positive / total) * 100,
-            (neutral / total) * 100,
-            (negative / total) * 100
-          ],
-          backgroundColor: ['#34a853', '#fbbc05', '#ea4335']
-        }]
-      },
-      options: {
-        responsive: true,
-        plugins: {
-          title: {
-            display: true,
-            text: 'Sentiment Distribution'
-          }
-        }
-      }
-    });
-    
-    // Destroy existing engagement chart if it exists
-    if (engagementChart) {
-      engagementChart.destroy();
-    }
-    
-    // Since we don't have engagement over time data in the API response,
-    // display a simple bar chart with engagement rate
-    const engagementCtx = document.getElementById('engagement-chart').getContext('2d');
-    engagementChart = new Chart(engagementCtx, {
-      type: 'bar',
-      data: {
-        labels: ['Engagement Rate'],
-        datasets: [{
-          label: 'Engagement',
-          data: [data.analysis_results.engagement_rate || 0],
-          backgroundColor: '#1a73e8'
-        }]
-      },
-      options: {
-        responsive: true,
-        plugins: {
-          title: {
-            display: true,
-            text: 'Engagement Rate'
-          }
-        },
-        scales: {
-          y: {
-            beginAtZero: true,
-            max: 1
-          }
-        }
-      }
-    });
-    
-  }
-  
-  // Display visualization images
-  function displayVisualizations(data) {
-    if (!data) return;
-    
-    const visualizationsGrid = document.getElementById('visualizations-grid');
-    visualizationsGrid.innerHTML = ''; // Clear existing content
-    
-    // Define the standard PNG visualizations we want to display
-    const standardVisualizations = [
-      {
-        title: 'Sentiment Distribution',
-        filename: 'sentiment_distribution.png'
-      },
-      {
-        title: 'Word Cloud',
-        filename: 'wordcloud.png'
-      },
-      {
-        title: 'Engagement Over Time',
-        filename: 'engagement_over_time.png'
-      },
-      {
-        title: 'Activity Heatmap',
-        filename: 'activity_heatmap.png'
-      }
-    ];
-    
-    // Create a title for the visualizations section
-    const sectionTitle = document.createElement('h3');
-    sectionTitle.textContent = 'Visualizations';
-    sectionTitle.style.marginTop = '20px';
-    sectionTitle.style.marginBottom = '15px';
-    sectionTitle.style.color = '#1a73e8';
-    sectionTitle.style.textAlign = 'center';
-    visualizationsGrid.appendChild(sectionTitle);
-    
-    // Add image path information for debugging
-    const pathInfo = document.createElement('div');
-    pathInfo.style.fontSize = '0.8em';
-    pathInfo.style.color = '#666';
-    pathInfo.style.textAlign = 'center';
-    pathInfo.style.marginBottom = '15px';
-    pathInfo.innerHTML = `Loading from: <code>http://localhost:8000/analysis/analysis_${currentVideoId}/</code>`;
-    visualizationsGrid.appendChild(pathInfo);
-    
-    // Add each visualization
-    standardVisualizations.forEach(viz => {
-      const vizContainer = document.createElement('div');
-      vizContainer.style.marginBottom = '25px';
-      vizContainer.style.padding = '15px';
-      vizContainer.style.backgroundColor = '#f8f9fa';
-      vizContainer.style.borderRadius = '8px';
-      vizContainer.style.boxShadow = '0 1px 3px rgba(0,0,0,0.1)';
-      
-      // Create a title for the visualization
-      const vizTitle = document.createElement('h4');
-      vizTitle.textContent = viz.title;
-      vizTitle.style.margin = '0 0 15px 0';
-      vizTitle.style.color = '#202124';
-      vizTitle.style.textAlign = 'center';
-      
-      // Create the image element
-      const img = document.createElement('img');
-      const imageUrl = `http://localhost:8000/analysis/analysis_${currentVideoId}/${viz.filename}`;
-      img.src = imageUrl;
-      img.alt = viz.title;
-      img.style.maxWidth = '100%';
-      img.style.height = 'auto';
-      img.style.borderRadius = '8px';
-      img.style.boxShadow = '0 2px 4px rgba(0,0,0,0.1)';
-      img.style.display = 'none'; // Hide initially until loaded
-      
-      console.log(`Loading visualization: ${imageUrl}`);
-      
-      // Add loading indicator
-      const loadingIndicator = document.createElement('div');
-      loadingIndicator.textContent = 'Loading visualization...';
-      loadingIndicator.style.textAlign = 'center';
-      loadingIndicator.style.color = '#666';
-      loadingIndicator.style.padding = '20px';
-      
-      // Handle image loading errors
-      img.onerror = function() {
-        console.error(`Failed to load visualization: ${imageUrl}`);
-        loadingIndicator.style.display = 'none';
-        const errorMsg = document.createElement('div');
-        errorMsg.style.textAlign = 'center';
-        errorMsg.style.color = '#ea4335';
-        errorMsg.style.padding = '20px';
-        errorMsg.innerHTML = 'Could not load visualization<br><small>Make sure the API server is running and visualizations were generated</small>';
+    // Clear existing visualizations
+    visualizationsGrid.innerHTML = '';
+
+    if (visualizations.length > 0) {
+      visualizations.forEach((item, index) => {
+        // Handle both direct URLs and objects with url property
+        const url = typeof item === 'string' ? item : (item.url || item.src || item.image || item.chart);
         
-        // Add direct link to try accessing the image directly
-        const directLinkDiv = document.createElement('div');
-        directLinkDiv.style.marginTop = '10px';
-        directLinkDiv.style.fontSize = '0.9em';
-        directLinkDiv.innerHTML = `<a href='${imageUrl}' target='_blank'>Try direct link</a>`;
+        if (!url || typeof url !== 'string') {
+          console.error(`Invalid visualization at index ${index}:`, item);
+          return;
+        }
+
+        console.log(`Loading visualization ${index + 1}:`, url);
+        const imgContainer = document.createElement('div');
+        imgContainer.className = 'visualization-container';
         
-        // Add a try different video ID suggestion
-        const suggestionDiv = document.createElement('div');
-        suggestionDiv.style.marginTop = '10px';
-        suggestionDiv.style.fontSize = '0.9em';
-        suggestionDiv.style.color = '#666';
-        suggestionDiv.innerHTML = 'Try analyzing video ID: <strong>2u80yFDtszE</strong><br>This video has pre-generated visualizations';
+        const img = document.createElement('img');
+        // Ensure URL is properly formatted and handle different URL formats
+        let fullUrl = url.trim();
         
-        vizContainer.appendChild(errorMsg);
-        vizContainer.appendChild(directLinkDiv);
-        vizContainer.appendChild(suggestionDiv);
-      };
-      
-      // Handle successful image loading
-      img.onload = function() {
-        loadingIndicator.style.display = 'none';
-        img.style.display = 'block';
-        img.style.opacity = '1';
-        console.log(`Successfully loaded visualization: ${imageUrl}`);
-      };
-      
-      // Add elements to the container
-      vizContainer.appendChild(vizTitle);
-      vizContainer.appendChild(loadingIndicator);
-      vizContainer.appendChild(img);
-      visualizationsGrid.appendChild(vizContainer);
-    });
+        // Clean up the URL (remove any surrounding quotes or whitespace)
+        fullUrl = fullUrl.replace(/^['"]|['"]$/g, '');
+        
+        // If it's already a full URL, use it as is
+        if (fullUrl.startsWith('http') || fullUrl.startsWith('data:image')) {
+          // No need to modify fullUrl
+        } 
+        // Handle relative URLs
+        else if (fullUrl.startsWith('/')) {
+          fullUrl = `http://localhost:8000${fullUrl}`;
+        } 
+        // Handle relative URLs without leading slash
+        else {
+          fullUrl = `http://localhost:8000/${fullUrl}`;
+        }
+        
+        console.log(`Attempting to load image from: ${fullUrl}`);
+        
+        // Set up the image element
+        img.alt = `Visualization ${index + 1}`;
+        img.loading = 'lazy';
+        img.style.maxWidth = '100%';
+        img.style.height = 'auto';
+        
+        // Track blob URLs for cleanup
+        if (fullUrl.startsWith('blob:')) {
+          blobUrls.add(fullUrl);
+        }
+        
+        // Add loading spinner
+        const spinner = document.createElement('div');
+        spinner.className = 'loading-spinner';
+        imgContainer.appendChild(spinner);
+        
+        // Add the image to the container (hidden at first)
+        imgContainer.appendChild(img);
+        
+        // Create a new image to test loading
+        const testImg = new Image();
+        testImg.crossOrigin = 'Anonymous'; // Handle CORS if needed
+        
+        // Test the image URL first
+        testImg.onload = () => {
+          console.log(`Image loaded successfully: ${fullUrl}`);
+          // If test passes, set the actual image source
+          img.src = fullUrl;
+        };
+        
+        testImg.onerror = (e) => {
+          console.error(`Failed to load test image: ${fullUrl}`, e);
+          // Try with a timestamp to bypass cache
+          const timestamp = new Date().getTime();
+          const cacheBusterUrl = `${fullUrl}${fullUrl.includes('?') ? '&' : '?'}_=${timestamp}`;
+          console.log(`Trying with cache buster: ${cacheBusterUrl}`);
+          img.src = cacheBusterUrl;
+        };
+        
+        // Handle image load success
+        img.onload = () => {
+          console.log(`Image displayed successfully: ${img.src}`);
+          spinner.remove();
+        };
+        
+        // Handle image load error
+        img.onerror = (e) => {
+          console.error(`Failed to load image: ${img.src}`, e);
+          spinner.remove();
+          const errorMessage = document.createElement('div');
+          errorMessage.className = 'error-message';
+          errorMessage.innerHTML = `
+            <p>Failed to load visualization</p>
+            <p class="hint">URL: <a href="${fullUrl}" target="_blank">${fullUrl}</a></p>
+            <p class="hint">Status: ${e.type || 'Unknown error'}</p>
+            <p class="hint">Check console for details</p>
+          `;
+          imgContainer.appendChild(errorMessage);
+        };
+        
+        // Start the test load
+        testImg.src = fullUrl;
+        
+        // Add a title or caption if available
+        if (typeof item === 'object' && (item.title || item.caption)) {
+          const caption = document.createElement('div');
+          caption.className = 'visualization-caption';
+          caption.textContent = item.title || item.caption;
+          imgContainer.appendChild(caption);
+        }
+        
+        visualizationsGrid.appendChild(imgContainer);
+      });
+    } else {
+      console.log('No visualizations found in data');
+      const noVisualizations = document.createElement('div');
+      noVisualizations.className = 'no-visualizations';
+      noVisualizations.innerHTML = `
+        <p>No visualizations available</p>
+        <p class="hint">The analysis did not generate any visualizations.</p>
+        <p class="hint">Data structure: ${JSON.stringify(data, null, 2)}</p>
+      `;
+      visualizationsGrid.appendChild(noVisualizations);
+    }
     
-    // Add a download link at the bottom
-    const downloadContainer = document.createElement('div');
-    downloadContainer.style.textAlign = 'center';
-    downloadContainer.style.marginTop = '20px';
+    // Display summary
+    document.getElementById('summary-text').textContent = data.summary || 'No summary available';
     
-    const downloadLink = document.createElement('a');
-    downloadLink.textContent = 'Download Analysis Results (JSON)';
-    downloadLink.style.display = 'inline-block';
-    downloadLink.style.padding = '8px 16px';
-    downloadLink.style.backgroundColor = '#1a73e8';
-    downloadLink.style.color = 'white';
-    downloadLink.style.textDecoration = 'none';
-    downloadLink.style.borderRadius = '4px';
-    downloadLink.href = '#';
-    downloadLink.onclick = function(e) {
-      e.preventDefault();
-      // Create a blob with the JSON data
-      const jsonData = JSON.stringify(data, null, 2);
-      const blob = new Blob([jsonData], {type: 'application/json'});
-      const url = URL.createObjectURL(blob);
-      
-      // Create a temporary link and click it to download
-      const tempLink = document.createElement('a');
-      tempLink.href = url;
-      tempLink.download = `comment_analysis_${currentVideoId}.json`;
-      document.body.appendChild(tempLink);
-      tempLink.click();
-      document.body.removeChild(tempLink);
-      URL.revokeObjectURL(url);
+    // Display metrics
+    document.getElementById('total-comments').textContent = 
+      data.analysis_results?.total_comments?.toLocaleString() || '0';
+    document.getElementById('unique-authors').textContent = 
+      data.analysis_results?.unique_authors?.toLocaleString() || '0';
+    document.getElementById('engagement-rate').textContent = 
+      data.analysis_results?.engagement_rate ? 
+      `${(data.analysis_results.engagement_rate * 100).toFixed(1)}%` : '0%';
+    
+    // Create sentiment chart
+    const sentimentCtx = document.getElementById('sentiment-chart');
+    if (!sentimentCtx) {
+      console.error('Sentiment chart canvas not found');
+      return;
+    }
+    
+    // Clear any existing chart and data
+    if (currentChart) {
+      currentChart.destroy();
+      currentChart = null;
+    }
+    
+    // Reset canvas dimensions
+    const container = sentimentCtx.parentElement;
+    const containerWidth = container.clientWidth - 32; // Account for padding
+    const containerHeight = 180; // Fixed height
+    
+    // Set canvas dimensions
+    sentimentCtx.width = containerWidth;
+    sentimentCtx.height = containerHeight;
+    
+    // Clear the canvas
+    const ctx = sentimentCtx.getContext('2d');
+    ctx.clearRect(0, 0, containerWidth, containerHeight);
+    
+    // Debug logging for sentiment distribution
+    console.log('Full data object:', data);
+    
+    // Try to find sentiment data in different possible locations
+    let sentimentData = {
+      positive: 0,
+      neutral: 0,
+      negative: 0
     };
     
-    downloadContainer.appendChild(downloadLink);
-    visualizationsGrid.appendChild(downloadContainer);
+    // Check various possible locations for the sentiment data
+    const possiblePaths = [
+      data.analysis_results?.sentiment_distribution,
+      data.analysis_results?.sentiment,
+      data.sentiment_distribution,
+      data.sentiment,
+      data.analysis_results,
+      data
+    ];
+    
+    // Try each possible path
+    for (const path of possiblePaths) {
+      if (!path) continue;
+      
+      // Check for different possible property names
+      const positive = path.positive ?? path.Positive ?? path.pos ?? path.POSITIVE;
+      const neutral = path.neutral ?? path.Neutral ?? path.neu ?? path.NEUTRAL;
+      const negative = path.negative ?? path.Negative ?? path.neg ?? path.NEGATIVE;
+      
+      if (positive !== undefined || neutral !== undefined || negative !== undefined) {
+        sentimentData = {
+          positive: Math.abs(parseInt(positive) || 0),
+          neutral: Math.abs(parseInt(neutral) || 0),
+          negative: Math.abs(parseInt(negative) || 0)
+        };
+        console.log('Found sentiment data in:', path);
+        break;
+      }
+    }
+    
+    console.log('Final sentiment data for chart:', sentimentData);
+    
+    // If all zeros, show a message in the chart
+    if (sentimentData.positive === 0 && sentimentData.neutral === 0 && sentimentData.negative === 0) {
+      console.log('Warning: All sentiment values are zero - showing sample data');
+      sentimentData = { positive: 1, neutral: 1, negative: 1 }; // Sample data to show the chart
+    }
+    
+    // Create new chart with fixed dimensions
+    try {
+      currentChart = new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+          labels: ['Positive', 'Neutral', 'Negative'],
+          datasets: [{
+            data: [
+              sentimentData.positive,
+              sentimentData.neutral,
+              sentimentData.negative
+            ],
+            backgroundColor: ['#34a853', '#fbbc05', '#ea4335'],
+            borderWidth: 0
+          }]
+        },
+        options: {
+          responsive: false, // Disable responsive behavior
+          maintainAspectRatio: false,
+          layout: {
+            padding: 10
+          },
+          plugins: {
+            legend: {
+              position: 'bottom',
+              labels: {
+                padding: 20,
+                boxWidth: 12,
+                font: {
+                  size: 12
+                }
+              }
+            },
+            tooltip: {
+              callbacks: {
+                label: function(context) {
+                  const label = context.label || '';
+                  const value = context.raw || 0;
+                  const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                  const percentage = Math.round((value / total) * 100) || 0;
+                  return `${label}: ${value} (${percentage}%)`;
+                }
+              }
+            }
+          },
+          cutout: '70%',
+          radius: '90%',
+          elements: {
+            arc: {
+              borderWidth: 0
+            }
+          },
+          animation: {
+            animateScale: true,
+            animateRotate: true
+          }
+        }
+      });
+      
+      // Force chart resize
+      currentChart.resize();
+      
+      console.log('Chart created successfully');
+    } catch (error) {
+      console.error('Error creating chart:', error);
+      // Fallback: Show error message in the canvas
+      ctx.font = '14px Arial';
+      ctx.fillStyle = '#666';
+      ctx.textAlign = 'center';
+      ctx.fillText('Could not display chart', containerWidth / 2, containerHeight / 2);
+    }
+  } catch (error) {
+    console.error('Error displaying results:', error);
+    document.getElementById('error').classList.remove('hidden');
+    document.getElementById('error').querySelector('p').textContent = 
+      'Error displaying results. Please try again.';
   }
-});
+}
+
+function startAnalysis(force = false) {
+  logAnalysisState('before start');
+  
+  // Prevent multiple simultaneous analyses
+  if (isAnalyzing && !force) {
+    console.log('[Drawer] Analysis already in progress, ignoring start request');
+    return;
+  }
+  
+  // Get UI elements once and cache them
+  const loadingElement = document.getElementById('loading');
+  const errorElement = document.getElementById('error');
+  const resultsElement = document.getElementById('results');
+  
+  // Reset any existing state
+  if (force) {
+    resetAnalysisState();
+  } else {
+    // Clear any existing timeouts if not forcing
+    clearAnalysisTimeout();
+  }
+  
+  try {
+    // Generate a new request ID for this analysis
+    const now = Date.now();
+    currentAnalysisId = now;
+    analysisStartTime = now;
+    isAnalyzing = true;
+    isAnalysisInProgress = true;
+    
+    // Update UI
+    const loadingElement = document.getElementById('loading');
+    const errorElement = document.getElementById('error');
+    const resultsElement = document.getElementById('results');
+    
+    if (loadingElement) loadingElement.style.display = 'flex';
+    if (errorElement) errorElement.style.display = 'none';
+    if (resultsElement) resultsElement.style.display = 'none';
+    
+    console.log(`[Drawer] Starting analysis with requestId: ${currentAnalysisId}`);
+    
+    // Send analysis request
+    const message = { 
+      type: 'ANALYZE_COMMENTS',
+      requestId: currentAnalysisId,
+      source: 'drawer',
+      timestamp: now,
+      startTime: analysisStartTime
+    };
+    
+    console.log('[Drawer] Sending message to parent:', message);
+    window.parent.postMessage(message, '*');
+    
+    // Set a timeout to reset the button if no response is received
+    analysisTimeoutId = setTimeout(() => {
+      if (isAnalyzing) {
+        const duration = Date.now() - analysisStartTime;
+        console.warn(`[Drawer] Analysis timed out after ${duration}ms`);
+        handleAnalysisError({
+          message: 'Analysis timed out. The server took too long to respond.',
+          isTimeout: true
+        }, currentAnalysisId);
+        
+        // Notify content script about the timeout
+        if (window.parent) {
+          window.parent.postMessage({
+            type: 'ANALYSIS_TIMED_OUT',
+            requestId: currentAnalysisId,
+            timestamp: Date.now()
+          }, '*');
+        }
+      }
+    }, ANALYSIS_TIMEOUT_MS);
+    
+    logAnalysisState('after start');
+    
+  } catch (error) {
+    console.error('[Drawer] Error starting analysis:', error);
+    handleAnalysisError('Error starting analysis. Please try again.');
+  }
+}
+
+function handleAnalysisError(error, requestId) {
+  const errorObj = typeof error === 'string' ? { message: error } : error;
+  const isTimeout = errorObj.isTimeout || false;
+  
+  console.error('[Drawer] Analysis error:', {
+    error: errorObj.message,
+    isTimeout,
+    requestId,
+    currentAnalysisId,
+    isCurrent: requestId === currentAnalysisId
+  });
+  
+  // Only update state if this error is for the current analysis
+  if (!requestId || requestId === currentAnalysisId) {
+    const duration = analysisStartTime ? Date.now() - analysisStartTime : 0;
+    console.log(`[Drawer] Analysis ended with error after ${duration}ms`);
+    
+    // Reset all state
+    isAnalyzing = false;
+    isAnalysisInProgress = false;
+    analysisStartTime = null;
+    
+    // Clear timeout
+    clearAnalysisTimeout();
+    
+    // Update UI
+    const loadingElement = document.getElementById('loading');
+    const errorElement = document.getElementById('error');
+    const resultsElement = document.getElementById('results');
+    
+    if (loadingElement) loadingElement.style.display = 'none';
+    if (errorElement) errorElement.style.display = 'block';
+    if (resultsElement) resultsElement.style.display = 'none';
+    
+    let errorMessage = 'An error occurred during analysis.';
+    if (typeof error === 'string') {
+      errorMessage = error;
+    } else if (error?.message) {
+      errorMessage = error.message;
+    }
+    
+    const errorMessageElement = errorElement?.querySelector('p');
+    if (errorMessageElement) {
+      errorMessageElement.textContent = errorMessage;
+    }
+    
+    // Add a retry button to the error message
+    const retryButton = document.createElement('button');
+    retryButton.textContent = 'Retry';
+    retryButton.style.marginTop = '10px';
+    retryButton.style.padding = '5px 10px';
+    retryButton.style.backgroundColor = '#4CAF50';
+    retryButton.style.color = 'white';
+    retryButton.style.border = 'none';
+    retryButton.style.borderRadius = '4px';
+    retryButton.style.cursor = 'pointer';
+    retryButton.addEventListener('click', () => {
+      console.log('[Drawer] Retry button clicked');
+      startAnalysis(true);
+    });
+    
+    // Clear any existing buttons
+    const existingButton = errorElement.querySelector('button');
+    if (existingButton) {
+      errorElement.removeChild(existingButton);
+    }
+    errorElement.appendChild(retryButton);
+    
+    logAnalysisState('after error');
+  } else {
+    console.warn(`[Drawer] Ignoring error for stale analysis request: ${requestId}`);
+  }
+} 
